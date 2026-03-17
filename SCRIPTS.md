@@ -95,7 +95,7 @@ python turbodiffusion/inference/wan2.1_t2v_infer.py \
 
 ## LoRA Merge for Inference
 
-If you have an **existing LoRA** (e.g. one trained with diffusers/PEFT or Kohya on the original Wan model) and want to run inference with TurboDiffusion, you need to **bake** the LoRA weights directly into the base model before quantizing and running inference.
+If you have an **existing LoRA** (e.g. one trained with diffusers/PEFT or Kohya on the original Wan model) and want to run inference with TurboDiffusion, you need to **merge** the LoRA weights directly into the base model before running inference. The subsequent `modify_model.py` deployment-preparation step (SLA attention replacement + INT8 quantization) is **optional** — see [Is quantization required?](#is-quantization-required) below.
 
 > **Why not use `merge_models.py`?**
 > `merge_models.py` performs *task arithmetic* on three full-sized model state dicts
@@ -118,15 +118,45 @@ HuggingFace base model (safetensors)
 base_model.pth
         │
         ▼  (2) lora_merge.py
-lora_merged.pth   (LoRA weights baked in)
+lora_merged.pth   (LoRA weights merged in)
         │
-        ▼  (3) modify_model.py  (called by quantize.sh)
-            [replace attention with SLA/SageSLA, optionally quantize linears]
-deployment_model.pth
+        ├──► (3) [OPTIONAL] modify_model.py  (called by quantize.sh)
+        │        [pre-process: replace attention + INT8-quantize linears]
+        │    deployment_model.pth
         │
         ▼  (4) inference  (wan2.1_t2v_infer.py or wan2.2_i2v_infer.py)
+            [pass --attention_type and --quant_linear if skipping step 3]
 output_video.mp4
 ```
+
+### Is quantization required?
+
+**No — the `modify_model.py` deployment step is optional.**
+
+The inference scripts (`wan2.1_t2v_infer.py`, `wan2.2_i2v_infer.py`) can apply all the same transformations at load time via command-line flags, so you can pass `lora_merged.pth` directly to inference:
+
+| Flag | Effect at inference time |
+|------|--------------------------|
+| `--attention_type sla` or `sagesla` | Replaces standard self-attention with SLA/SageSLA on the fly |
+| *(no flag)* `--attention_type original` | Keeps the original attention, no replacement |
+| `--quant_linear` | Wraps `nn.Linear` layers in `Int8Linear` module structure before loading weights |
+| *(no flag)* | Keeps standard `nn.Linear` throughout |
+
+> **Note on `--quant_linear` at inference time vs. pre-processing:**
+> When `modify_model.py` is run standalone (`quantize.sh`), it computes true INT8
+> quantization of the weight tensors (`quantize=True`) and saves the pre-scaled
+> INT8 weights to disk. When the inference scripts do the replacement at load time
+> they use `quantize=False`, which installs the `Int8Linear` module structure
+> but leaves weights in their original precision. For full INT8 VRAM savings,
+> pre-process with `modify_model.py --quant_linear` once and reuse the deployment
+> checkpoint for all subsequent inference runs.
+
+**Choose the right path for your use case:**
+
+| Path | When to use |
+|------|-------------|
+| **Direct inference** (skip step 3) | Quick testing, one-off runs, or when VRAM is not a constraint |
+| **Pre-process then infer** (use step 3) | Repeated inference, production deployment, or when you want true INT8 VRAM savings |
 
 ### Step-by-step explanation
 
@@ -134,8 +164,8 @@ output_video.mp4
 |------|--------|--------------|
 | **1** | `turbodiffusion/scripts/safetensors_to_pth.py` | Convert the downloaded HuggingFace base model from sharded `.safetensors` to `base_model.pth`. Pass `--prefix net.` so key names match the TurboDiffusion format. |
 | **2** | `turbodiffusion/scripts/lora_merge.py` | Bake the LoRA weights into `base_model.pth`. For each LoRA layer pair computes `delta = lora_up @ lora_down * (alpha / rank) * scale` and adds it to the corresponding base weight. Outputs `lora_merged.pth`. |
-| **3** | `turbodiffusion/inference/modify_model.py` (via `scripts/quantize.sh`) | Replace attention with SLA/SageSLA, swap in fused norms, and optionally quantize linear layers to Int8. |
-| **4** | `scripts/inference_wan2.1_t2v.sh` / `scripts/inference_wan2.2_i2v.sh` | Run TurboDiffusion inference. |
+| **3 *(optional)*** | `turbodiffusion/inference/modify_model.py` (via `scripts/quantize.sh`) | Pre-bake SLA/SageSLA attention, fused norms, and optionally INT8-quantize linear layers. Saves a ready-to-load `deployment_model.pth`. Recommended for repeated/production runs; skip for quick one-off testing. |
+| **4** | `scripts/inference_wan2.1_t2v.sh` / `scripts/inference_wan2.2_i2v.sh` | Run TurboDiffusion inference. If step 3 was skipped, pass `--attention_type` and (optionally) `--quant_linear` to the inference script so it applies the same transformations at load time. |
 
 ### Key-prefix mapping
 
@@ -154,6 +184,12 @@ If your LoRA was trained using a different prefix, pass the matching
 `--lora_key_prefix net.`.
 
 ### Concrete example (Wan2.1-T2V-1.3B + LoRA)
+
+#### Path A — Direct inference (skip pre-processing)
+
+Simpler. Best for quick testing or one-off runs. Attention and norm replacement happen
+at every `create_model()` call; `--quant_linear` sets up `Int8Linear` module structure
+but does not compute true INT8 weight scaling.
 
 ```bash
 export PYTHONPATH=turbodiffusion
@@ -174,7 +210,42 @@ python turbodiffusion/scripts/lora_merge.py \
     --lora_key_prefix transformer. \
     --model_key_prefix net.
 
-# 3. Prepare for deployment (replace attention + quantize)
+# 3. Run inference directly on the merged checkpoint
+python turbodiffusion/inference/wan2.1_t2v_infer.py \
+    --model Wan2.1-1.3B \
+    --dit_path checkpoints/lora_merged.pth \
+    --prompt "Your prompt here" \
+    --resolution 480p \
+    --num_steps 4 \
+    --attention_type sagesla
+```
+
+#### Path B — Pre-process then infer (recommended for production)
+
+Runs `modify_model.py` once to pre-bake SLA attention and compute true INT8 weight
+quantization. Every subsequent inference call loads the smaller, faster deployment
+checkpoint without repeating those transformations.
+
+```bash
+export PYTHONPATH=turbodiffusion
+
+# 1. Convert HuggingFace base model to .pth  (same as Path A)
+python turbodiffusion/scripts/safetensors_to_pth.py \
+    --model_dir /path/to/Wan2.1-T2V-1.3B \
+    --output_path checkpoints/base_model.pth \
+    --prefix net.
+
+# 2. Bake the LoRA into the base model  (same as Path A)
+python turbodiffusion/scripts/lora_merge.py \
+    --base_model checkpoints/base_model.pth \
+    --lora       my_lora.safetensors \
+    --output     checkpoints/lora_merged.pth \
+    --scale      1.0 \
+    --lora_key_prefix transformer. \
+    --model_key_prefix net.
+
+# 3. Pre-process for deployment (replace attention + INT8 quantize)
+#    Run once; the resulting deployment_model.pth can be reused for all runs.
 python turbodiffusion/inference/modify_model.py \
     --model Wan2.1-1.3B \
     --input_path  checkpoints/lora_merged.pth \
@@ -182,15 +253,15 @@ python turbodiffusion/inference/modify_model.py \
     --attention_type sla \
     --quant_linear
 
-# 4. Run inference
+# 4. Run inference using the pre-processed checkpoint
 python turbodiffusion/inference/wan2.1_t2v_infer.py \
     --model Wan2.1-1.3B \
     --dit_path checkpoints/deployment_model.pth \
     --prompt "Your prompt here" \
     --resolution 480p \
     --num_steps 4 \
-    --quant_linear \
-    --attention_type sagesla
+    --attention_type sagesla \
+    --quant_linear
 ```
 
 ---
