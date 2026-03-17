@@ -13,9 +13,12 @@ Citation (please cite if you use this code):
 }
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
 
 SAGESLA_ENABLED = True
 try:
@@ -33,6 +36,34 @@ except ImportError:
 
 from .kernel import _attention
 from .utils import get_block_map, get_cuda_arch
+
+
+def _sdpa_fallback(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Run scaled dot-product attention with a best-effort backend selection.
+
+    Tries hardware-accelerated backends (Flash Attention, cuDNN, efficient
+    attention) in order, and falls back to the pure-math implementation as a
+    final safety net so the forward pass never crashes.
+
+    Args:
+        q, k, v: tensors of shape (B, H, L, D) in the model's working dtype.
+
+    Returns:
+        Output tensor of shape (B, H, L, D).
+    """
+    backends = [
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.CUDNN_ATTENTION,
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.MATH,
+    ]
+    try:
+        with _sdpa_kernel(backends):
+            return F.scaled_dot_product_attention(q, k, v)
+    except RuntimeError:
+        with _sdpa_kernel([SDPBackend.MATH]):
+            return F.scaled_dot_product_attention(q, k, v)
 
 
 class SparseLinearAttention(nn.Module):
@@ -93,13 +124,27 @@ class SparseLinearAttention(nn.Module):
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-        
-        sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
 
         q = q.to(self.dtype)
         k = k.to(self.dtype)
         v = v.to(self.dtype)
-        o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+
+        # Try the Triton-based sparse attention kernel.  If it fails (e.g. on an
+        # unsupported GPU or when Triton cannot compile for the current device),
+        # fall back to standard SDPA so inference can still proceed.
+        sparse_map = None
+        real_topk = None
+        try:
+            sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+            o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+        except RuntimeError as e:
+            warnings.warn(
+                f"SLA Triton sparse kernel failed ({e!r}); "
+                "falling back to SDPA for the sparse attention component.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            o_s = _sdpa_fallback(q, k, v)
         
         q = self.feature_map_q(q).contiguous().to(self.dtype) # c_q
         k = self.feature_map_k(k).contiguous().to(self.dtype) # c_k
@@ -114,9 +159,11 @@ class SparseLinearAttention(nn.Module):
         o = (o_s + o_l).to(dtype).transpose(1, 2)
 
         if return_sparsity:
-            return o, real_topk / sparse_map.shape[-1]
-        else:
-            return o
+            if sparse_map is not None:
+                return o, real_topk / sparse_map.shape[-1]
+            # Fell back to full SDPA — report 1.0 (all tokens attended to).
+            return o, 1.0
+        return o
 
 
 class SageSparseLinearAttention(nn.Module):
@@ -194,49 +241,84 @@ class SageSparseLinearAttention(nn.Module):
 
         ########## SPARGE BEGIN ##########
 
-        km = k.mean(dim=-2, keepdim=True)
-        headdim = q.size(-1)
-        
-        if arch == "sm90":
-            q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q, k, km, 64, 128)
-        else:
-            q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q, k, km, 128, 64)
-        lut, valid_block_num = block_map_lut_triton(sparse_map)
-        scale = 1.0 / (headdim ** 0.5)
-
-        assert headdim in [64, 128], "headdim should be in [64, 128]. For other headdim, you can use padding and specify the softmax scale."
-
-        o_s = torch.empty_like(q)
-
-        if arch in ("sm80", "sm86", "sm87"):
-            pvthreshold = torch.full((q.shape[-3],), 1e6, dtype=torch.float32, device=q.device)
-            v_fp16 = v.to(torch.float16)
-            qattn.qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold(
-                q_int8, k_int8, v_fp16, o_s, lut, valid_block_num, pvthreshold, q_scale, k_scale, 1, False, 1, scale, 0
-            )
-        else:
-            b, h_kv, kv_len, head_dim = v.shape
-            padded_len = (kv_len + 127) // 128 * 128
-            v_transposed_permutted = torch.empty((b, h_kv, head_dim, padded_len), dtype=v.dtype, device=v.device)
-            fused.transpose_pad_permute_cuda(v, v_transposed_permutted, 1)
-            v_fp8 = torch.empty(v_transposed_permutted.shape, dtype=torch.float8_e4m3fn, device=v.device)
-            v_scale = torch.empty((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
-            fused.scale_fuse_quant_cuda(v_transposed_permutted, v_fp8, v_scale, kv_len, 2.25, 1)
-
+        o_s = None
+        try:
+            km = k.mean(dim=-2, keepdim=True)
+            headdim = q.size(-1)
+            
             if arch == "sm90":
-                qattn.qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
-                    q_int8, k_int8, v_fp8, o_s, lut, valid_block_num, q_scale, k_scale, v_scale, 1, False, 1, scale
+                q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q, k, km, 64, 128)
+            else:
+                q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q, k, km, 128, 64)
+            lut_blk, valid_block_num = block_map_lut_triton(sparse_map)
+            scale = 1.0 / (headdim ** 0.5)
+
+            assert headdim in [64, 128], "headdim should be in [64, 128]. For other headdim, you can use padding and specify the softmax scale."
+
+            o_s = torch.empty_like(q)
+
+            if arch in ("sm80", "sm86", "sm87"):
+                pvthreshold = torch.full((q.shape[-3],), 1e6, dtype=torch.float32, device=q.device)
+                v_fp16 = v.to(torch.float16)
+                qattn.qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold(
+                    q_int8, k_int8, v_fp16, o_s, lut_blk, valid_block_num, pvthreshold, q_scale, k_scale, 1, False, 1, scale, 0
                 )
             else:
-                pvthreshold = torch.full((q.shape[-3],), 1e6, dtype=torch.float32, device=q.device)
-                if SAGE2PP_ENABLED:
-                    qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold(
-                        q_int8, k_int8, v_fp8, o_s, lut, valid_block_num, pvthreshold, q_scale, k_scale, v_scale, 1, False, 1, scale, 0
+                b, h_kv, kv_len, head_dim = v.shape
+                padded_len = (kv_len + 127) // 128 * 128
+                v_transposed_permutted = torch.empty((b, h_kv, head_dim, padded_len), dtype=v.dtype, device=v.device)
+                fused.transpose_pad_permute_cuda(v, v_transposed_permutted, 1)
+                v_fp8 = torch.empty(v_transposed_permutted.shape, dtype=torch.float8_e4m3fn, device=v.device)
+                v_scale = torch.empty((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
+                fused.scale_fuse_quant_cuda(v_transposed_permutted, v_fp8, v_scale, kv_len, 2.25, 1)
+
+                if arch == "sm90":
+                    qattn.qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
+                        q_int8, k_int8, v_fp8, o_s, lut_blk, valid_block_num, q_scale, k_scale, v_scale, 1, False, 1, scale
                     )
                 else:
-                    qattn.qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold(
-                        q_int8, k_int8, v_fp8, o_s, lut, valid_block_num, pvthreshold, q_scale, k_scale, v_scale, 1, False, 1, scale, 0
+                    pvthreshold = torch.full((q.shape[-3],), 1e6, dtype=torch.float32, device=q.device)
+                    if SAGE2PP_ENABLED:
+                        qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold(
+                            q_int8, k_int8, v_fp8, o_s, lut_blk, valid_block_num, pvthreshold, q_scale, k_scale, v_scale, 1, False, 1, scale, 0
+                        )
+                    else:
+                        qattn.qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold(
+                            q_int8, k_int8, v_fp8, o_s, lut_blk, valid_block_num, pvthreshold, q_scale, k_scale, v_scale, 1, False, 1, scale, 0
+                        )
+
+        except RuntimeError as e:
+            # SPARGE kernel failed (e.g. unsupported GPU or driver mismatch).
+            # Try the pure-Triton SLA kernel as an intermediate fallback: it only
+            # supports BLOCK_N == 64, so recompute the block map with compatible
+            # sizes when SPARGE used sm90 sizing (BLKK=128).
+            warnings.warn(
+                f"SageSLA SPARGE kernel failed ({e!r}); "
+                "attempting SLA Triton kernel as intermediate fallback.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            try:
+                if arch == "sm90":
+                    # Recompute sparse_map/lut with SLA-compatible block sizes.
+                    sparse_map_sla, lut_sla, real_topk_sla = get_block_map(
+                        q, k, topk_ratio=self.topk, BLKQ=128, BLKK=64
                     )
+                else:
+                    sparse_map_sla, lut_sla, real_topk_sla = sparse_map, lut, real_topk
+                o_s = _attention.apply(q, k, v, sparse_map_sla, lut_sla, real_topk_sla, 128, 64)
+                sparse_map = sparse_map_sla
+                real_topk = real_topk_sla
+            except RuntimeError as e2:
+                # Both SPARGE and SLA Triton kernels failed; use SDPA as final fallback.
+                warnings.warn(
+                    f"SLA Triton fallback also failed ({e2!r}); "
+                    "using SDPA as final fallback.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                o_s = _sdpa_fallback(q, k, v)
+                sparse_map = None
 
         ########## SPARGE END ##########
 
@@ -253,6 +335,8 @@ class SageSparseLinearAttention(nn.Module):
         o = (o_s + o_l).to(dtype).transpose(1, 2)
 
         if return_sparsity:
-            return o, real_topk / sparse_map.shape[-1]
-        else:
-            return o
+            if sparse_map is not None:
+                return o, real_topk / sparse_map.shape[-1]
+            # Fell back to full SDPA — report 1.0 (all tokens attended to).
+            return o, 1.0
+        return o

@@ -56,6 +56,7 @@
 # |----------------|-------|
 #
 
+import warnings
 from functools import partial
 
 import torch
@@ -65,7 +66,7 @@ try:
     from flash_attn_3.flash_attn_interface import flash_attn_func
 
     FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     FLASH_ATTN_3_AVAILABLE = False
 
 
@@ -119,6 +120,14 @@ def attention(
             deterministic=deterministic,
         )[0]
     else:
+        if deterministic:
+            warnings.warn(
+                "deterministic=True is only supported with Flash Attention 3 on SM90. "
+                "Proceeding without deterministic mode.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         # If Blackwell or Hopper (SM100 or SM90), cuDNN has native FMHA kernels. The Hopper one is
         # not always as fast as Flash Attention 3, but when Flash Attention is unavailable, it's
         # still a far better choice than Flash Attention 2 (Ampere).
@@ -127,6 +136,7 @@ def attention(
                 SDPBackend.CUDNN_ATTENTION,
                 SDPBackend.FLASH_ATTENTION,
                 SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
             ]
             BEST_SDPA_BACKEND = SDPBackend.CUDNN_ATTENTION
         elif is_half:
@@ -134,15 +144,13 @@ def attention(
                 SDPBackend.FLASH_ATTENTION,
                 SDPBackend.CUDNN_ATTENTION,
                 SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
             ]
             BEST_SDPA_BACKEND = SDPBackend.FLASH_ATTENTION if compute_cap >= 80 else SDPBackend.EFFICIENT_ATTENTION
         else:
             assert dtype == torch.float32, f"Unrecognized {dtype=}."
-            SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION]
+            SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
             BEST_SDPA_BACKEND = SDPBackend.EFFICIENT_ATTENTION
-
-        if deterministic:
-            raise NotImplementedError("Deterministic mode in attention is only supported when Flash Attention 3 is available.")
 
         # Torch 2.6 and later allows priorities for backends, but for older versions
         # we can only run with a specific backend. As long as we pick ones we're certain
@@ -158,15 +166,27 @@ def attention(
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        with sdpa_kernel_(backends=SDPA_BACKENDS):
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                is_causal=causal,
-                dropout_p=dropout_p,
-                scale=softmax_scale,
-            )
+        try:
+            with sdpa_kernel_(backends=SDPA_BACKENDS):
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    is_causal=causal,
+                    dropout_p=dropout_p,
+                    scale=softmax_scale,
+                )
+        except RuntimeError:
+            # Final safety net: all preferred backends failed, force pure math SDPA.
+            with sdpa_kernel([SDPBackend.MATH]):
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    is_causal=causal,
+                    dropout_p=dropout_p,
+                    scale=softmax_scale,
+                )
 
         out = out.transpose(1, 2).contiguous()
         return out

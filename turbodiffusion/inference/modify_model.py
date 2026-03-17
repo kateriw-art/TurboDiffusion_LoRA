@@ -14,6 +14,7 @@ Citation (please cite if you use this code):
 """
 
 import argparse
+import warnings
 
 import torch
 from rcm.utils.model_utils import load_state_dict
@@ -35,6 +36,7 @@ from SLA import (
     SparseLinearAttention as SLA,
     SageSparseLinearAttention as SageSLA
 )
+from SLA.core import SAGESLA_ENABLED
 
 
 def replace_attention(
@@ -43,7 +45,30 @@ def replace_attention(
     sla_topk: float,
 ) -> torch.nn.Module:
     assert attention_type in ["sla", "sagesla"], "Invalid attention type."
-    
+
+    # Sparse/custom attention kernels (SLA, SageSLA) require CUDA and Triton.
+    # Skip replacement entirely when running without a CUDA device so the model
+    # still works with standard PyTorch SDPA.
+    if not torch.cuda.is_available():
+        warnings.warn(
+            f"CUDA is not available; skipping {attention_type} attention replacement. "
+            "Standard attention will be used.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return model
+
+    # SageSLA requires the optional spas_sage_attn package.  Fall back to the
+    # pure-Triton SLA path if it is not installed.
+    if attention_type == "sagesla" and not SAGESLA_ENABLED:
+        warnings.warn(
+            "SageSLA requested but spas_sage_attn is not installed. "
+            "Falling back to SLA attention.",
+            UserWarning,
+            stacklevel=2,
+        )
+        attention_type = "sla"
+
     for module in model.modules():
         if type(module) is WanSelfAttention2pt1 or type(module) is WanSelfAttention2pt2:
             if attention_type == "sla":
