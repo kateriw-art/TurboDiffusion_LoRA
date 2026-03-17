@@ -93,6 +93,108 @@ python turbodiffusion/inference/wan2.1_t2v_infer.py \
 
 ---
 
+## LoRA Merge for Inference
+
+If you have an **existing LoRA** (e.g. one trained with diffusers/PEFT or Kohya on the original Wan model) and want to run inference with TurboDiffusion, you need to **bake** the LoRA weights directly into the base model before quantizing and running inference.
+
+> **Why not use `merge_models.py`?**
+> `merge_models.py` performs *task arithmetic* on three full-sized model state dicts
+> (`result = base + w × (target − base)`). A LoRA file is not a full model snapshot —
+> it stores only low-rank adapter matrices (`lora_A`/`lora_B` or `lora_down`/`lora_up`).
+> Use `lora_merge.py` (below) instead.
+
+> **Why not use `safetensors_to_pth.py`?**
+> That script expects a sharded base model with a
+> `diffusion_pytorch_model.safetensors.index.json` index file.
+> LoRA safetensors files are single, unsharded files without this index and
+> require different handling.
+
+### Pipeline
+
+```
+HuggingFace base model (safetensors)
+        │
+        ▼  (1) safetensors_to_pth.py
+base_model.pth
+        │
+        ▼  (2) lora_merge.py
+lora_merged.pth   (LoRA weights baked in)
+        │
+        ▼  (3) modify_model.py  (called by quantize.sh)
+            [replace attention with SLA/SageSLA, optionally quantize linears]
+deployment_model.pth
+        │
+        ▼  (4) inference  (wan2.1_t2v_infer.py or wan2.2_i2v_infer.py)
+output_video.mp4
+```
+
+### Step-by-step explanation
+
+| Step | Script | What it does |
+|------|--------|--------------|
+| **1** | `turbodiffusion/scripts/safetensors_to_pth.py` | Convert the downloaded HuggingFace base model from sharded `.safetensors` to `base_model.pth`. Pass `--prefix net.` so key names match the TurboDiffusion format. |
+| **2** | `turbodiffusion/scripts/lora_merge.py` | Bake the LoRA weights into `base_model.pth`. For each LoRA layer pair computes `delta = lora_up @ lora_down * (alpha / rank) * scale` and adds it to the corresponding base weight. Outputs `lora_merged.pth`. |
+| **3** | `turbodiffusion/inference/modify_model.py` (via `scripts/quantize.sh`) | Replace attention with SLA/SageSLA, swap in fused norms, and optionally quantize linear layers to Int8. |
+| **4** | `scripts/inference_wan2.1_t2v.sh` / `scripts/inference_wan2.2_i2v.sh` | Run TurboDiffusion inference. |
+
+### Key-prefix mapping
+
+The original Wan model on HuggingFace stores weights without any top-level prefix
+(`patch_embedding.weight`, `blocks.0. …`). `safetensors_to_pth.py --prefix net.` adds
+the `net.` prefix expected by TurboDiffusion.
+
+LoRA files trained on the original HuggingFace Wan model via diffusers/PEFT typically
+prefix keys with `transformer.` (e.g.
+`transformer.blocks.0.attn.to_q.lora_A.weight`). `lora_merge.py` strips that prefix
+and prepends `net.` by default, giving the correct lookup key
+`net.blocks.0.attn.to_q.weight`.
+
+If your LoRA was trained using a different prefix, pass the matching
+`--lora_key_prefix` value. If the LoRA already uses `net.` keys, pass
+`--lora_key_prefix net.`.
+
+### Concrete example (Wan2.1-T2V-1.3B + LoRA)
+
+```bash
+export PYTHONPATH=turbodiffusion
+
+# 1. Convert HuggingFace base model to .pth
+python turbodiffusion/scripts/safetensors_to_pth.py \
+    --model_dir /path/to/Wan2.1-T2V-1.3B \
+    --output_path checkpoints/base_model.pth \
+    --prefix net.
+
+# 2. Bake the LoRA into the base model
+#    (adjust --lora_key_prefix if your LoRA uses a different prefix)
+python turbodiffusion/scripts/lora_merge.py \
+    --base_model checkpoints/base_model.pth \
+    --lora       my_lora.safetensors \
+    --output     checkpoints/lora_merged.pth \
+    --scale      1.0 \
+    --lora_key_prefix transformer. \
+    --model_key_prefix net.
+
+# 3. Prepare for deployment (replace attention + quantize)
+python turbodiffusion/inference/modify_model.py \
+    --model Wan2.1-1.3B \
+    --input_path  checkpoints/lora_merged.pth \
+    --output_path checkpoints/deployment_model.pth \
+    --attention_type sla \
+    --quant_linear
+
+# 4. Run inference
+python turbodiffusion/inference/wan2.1_t2v_infer.py \
+    --model Wan2.1-1.3B \
+    --dit_path checkpoints/deployment_model.pth \
+    --prompt "Your prompt here" \
+    --resolution 480p \
+    --num_steps 4 \
+    --quant_linear \
+    --attention_type sagesla
+```
+
+---
+
 ## Shell Scripts (`scripts/`)
 
 ### `scripts/inference_wan2.1_t2v.sh`
@@ -203,13 +305,17 @@ torchrun --nproc_per_node=<N> -m scripts.train \
 ---
 
 ### `turbodiffusion/scripts/merge_models.py`
-**Purpose:** Merge three PyTorch model checkpoints using vector arithmetic:
+**Purpose:** Merge three full-sized PyTorch model checkpoints using vector arithmetic (task arithmetic / model soup):
 
 ```
 Result = Base + w × (Diff_Target − Diff_Base)
 ```
 
-Useful for applying a trained delta (e.g., a LoRA-style difference) to a base model with a configurable interpolation weight.
+Useful for applying a trained delta from a full fine-tune back onto a base model with a configurable interpolation weight.
+
+> **Note:** This script expects three **complete** model state dicts of identical key structure.
+> It is **not** designed for LoRA files (which store only low-rank adapter matrices).
+> To bake a LoRA into a base model, use `lora_merge.py` instead.
 
 **Usage:**
 ```bash
@@ -270,6 +376,41 @@ python turbodiffusion/scripts/safetensors_to_pth.py \
 | `--model_dir` | *(required)* | Directory containing the index JSON and shard files |
 | `--output_path` | *(required)* | Output path for the merged `.pth` file |
 | `--prefix` | `None` | Optional prefix prepended to all state-dict keys (e.g., `net.`) |
+
+---
+
+### `turbodiffusion/scripts/lora_merge.py`
+**Purpose:** Bake a LoRA checkpoint into a base model `.pth` file, producing a single merged checkpoint ready for deployment. For each LoRA layer pair the weight delta is computed as:
+
+```
+delta_W = lora_up @ lora_down × (alpha / rank) × scale
+```
+
+and added to the corresponding base-model weight. Supports both **Diffusers/PEFT** (`lora_A` / `lora_B`) and **Kohya** (`lora_down` / `lora_up`) key formats. Reads `alpha` values from the LoRA file when present; defaults to `alpha = rank` (i.e. effective scale = 1) otherwise.
+
+A configurable key-prefix remapping (`--lora_key_prefix` / `--model_key_prefix`) handles the mismatch between the `transformer.` prefix in Diffusers-trained LoRAs and the `net.` prefix in TurboDiffusion base models.
+
+**Usage:**
+```bash
+python turbodiffusion/scripts/lora_merge.py \
+    --base_model checkpoints/base_model.pth \
+    --lora       my_lora.safetensors \
+    --output     checkpoints/lora_merged.pth \
+    [--scale 1.0] \
+    [--lora_key_prefix transformer.] \
+    [--model_key_prefix net.]
+```
+
+**Key arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--base_model` | *(required)* | Path to the base model `.pth` file (e.g. from `safetensors_to_pth.py`) |
+| `--lora` | *(required)* | Path to the LoRA file (`.safetensors`, `.pth`, or `.pt`) |
+| `--output` | *(required)* | Output path for the merged `.pth` file |
+| `--scale` | `1.0` | Global LoRA strength multiplier applied on top of `alpha/rank` |
+| `--lora_key_prefix` | `transformer.` | Prefix in LoRA keys to strip before remapping. Use `net.` if the LoRA was trained with TurboDiffusion keys. |
+| `--model_key_prefix` | `net.` | Prefix to prepend after stripping `--lora_key_prefix` |
 
 ---
 
