@@ -14,6 +14,7 @@ Citation (please cite if you use this code):
 """
 
 import argparse
+import warnings
 
 import torch
 from rcm.utils.model_utils import load_state_dict
@@ -35,6 +36,7 @@ from SLA import (
     SparseLinearAttention as SLA,
     SageSparseLinearAttention as SageSLA
 )
+from SLA.core import SAGESLA_ENABLED
 
 
 def replace_attention(
@@ -43,7 +45,30 @@ def replace_attention(
     sla_topk: float,
 ) -> torch.nn.Module:
     assert attention_type in ["sla", "sagesla"], "Invalid attention type."
-    
+
+    # Sparse/custom attention kernels (SLA, SageSLA) require CUDA and Triton.
+    # Skip replacement entirely when running without a CUDA device so the model
+    # still works with standard PyTorch SDPA.
+    if not torch.cuda.is_available():
+        warnings.warn(
+            f"CUDA is not available; skipping {attention_type} attention replacement. "
+            "Standard attention will be used.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return model
+
+    # SageSLA requires the optional spas_sage_attn package.  Fall back to the
+    # pure-Triton SLA path if it is not installed.
+    if attention_type == "sagesla" and not SAGESLA_ENABLED:
+        warnings.warn(
+            "SageSLA requested but spas_sage_attn is not installed. "
+            "Falling back to SLA attention.",
+            UserWarning,
+            stacklevel=2,
+        )
+        attention_type = "sla"
+
     for module in model.modules():
         if type(module) is WanSelfAttention2pt1 or type(module) is WanSelfAttention2pt2:
             if attention_type == "sla":
@@ -132,12 +157,37 @@ def create_model(dit_path: str, args: argparse.Namespace) -> torch.nn.Module:
         net = select_model(args.model)
 
     state_dict = load_state_dict(dit_path)
+
+    # Auto-detect whether the checkpoint already contains pre-quantized Int8Linear
+    # weights (indicated by the presence of 'int8_weight' keys).  The module
+    # structure installed before load_state_dict must match the checkpoint keys:
+    #   - pre-quantized checkpoint  → install Int8Linear structure (int8_weight / scale)
+    #   - plain float checkpoint    → keep nn.Linear structure (weight)
+    checkpoint_is_quantized = any("int8_weight" in k for k in state_dict)
+
     if args.attention_type in ['sla', 'sagesla']:
         net = replace_attention(net, attention_type=args.attention_type, sla_topk=args.sla_topk)
-    replace_linear_norm(net, replace_linear=args.quant_linear, replace_norm=not args.default_norm, quantize=False)
+
+    # Install Int8Linear module structure only when the checkpoint already uses
+    # int8_weight keys.  For plain float checkpoints, always load with standard
+    # nn.Linear first to avoid key mismatches.
+    replace_linear_norm(
+        net,
+        replace_linear=checkpoint_is_quantized,
+        replace_norm=not args.default_norm,
+        quantize=False,
+    )
     net.load_state_dict(state_dict, assign=True)
     net = net.to(tensor_kwargs["device"]).eval()
     del state_dict
+
+    # If the user requested INT8 quantization but the checkpoint was stored as
+    # plain float weights, quantize the already-loaded weights in-memory now.
+    # This is equivalent to what the standalone modify_model.py script does, and
+    # produces the same true INT8 scale factors (quantize=True).
+    if args.quant_linear and not checkpoint_is_quantized:
+        replace_linear_norm(net, replace_linear=True, replace_norm=False, quantize=True)
+
     return net
 
 
