@@ -9,7 +9,7 @@ This document summarizes every runnable script in the TurboDiffusion repository,
 The scripts form a sequential fine-tuning and deployment pipeline. The diagram below shows the order of operations and the file that is produced at each step.
 
 ```
-HuggingFace safetensors weights
+Hugging Face safetensors weights
         │
         ▼  (1) safetensors_to_pth.py
 base_model.pth   ◄──── also keep a copy as "diff_base" for the merge step
@@ -35,21 +35,21 @@ output_video.mp4
 
 | Step | Script | What it does |
 |------|--------|--------------|
-| **1** | `turbodiffusion/scripts/safetensors_to_pth.py` | Converts a locally saved pretrained Wan base model from HuggingFace sharded `.safetensors` format into a single `base_model.pth`. Download the model weights first (e.g. via `huggingface-cli download` or `wget`), then point `--model_dir` at the directory. Add `--prefix net.` so key names match the training framework. Keep this file — it serves as both the training starting point and the `--diff_base` argument in the merge step. |
+| **1** | `turbodiffusion/scripts/safetensors_to_pth.py` | Converts a locally saved pretrained Wan base model from Hugging Face sharded `.safetensors` format into a single `base_model.pth`. Download the model weights first (e.g. via `huggingface-cli download` or `wget`), then point `--model_dir` at the directory. Add `--prefix net.` so key names match the training framework. Keep this file — it serves as both the training starting point and the `--diff_base` argument in the merge step. |
 | **2** | `turbodiffusion/scripts/train.py` | Fine-tunes the model (rCM distillation / LoRA / full fine-tune). The trainer loads `base_model.pth` via the config and **automatically saves checkpoints in PyTorch Distributed Checkpoint (DCP) format** — no separate conversion is needed before training. |
 | **3** | `turbodiffusion/scripts/dcp_to_pth.py` | Converts the DCP checkpoint directory produced by training into a single `finetuned_model.pth`. Extracts the EMA weights (`net_ema.*` → `net.*`) and saves in `bfloat16`. |
 | **4** | `turbodiffusion/scripts/merge_models.py` | Applies the trained delta back onto the original base model using vector arithmetic: `merged = base + w × (finetuned − base)`. Pass `base_model.pth` as both `--base` and `--diff_base`, and `finetuned_model.pth` as `--diff_target`. Adjust `--w` (default `1.0`) to control how strongly the fine-tuning is applied. |
 | **5** | `turbodiffusion/inference/modify_model.py` (via `scripts/quantize.sh`) | Prepares `merged_model.pth` for fast deployment: replaces self-attention with SLA or SageSLA, swaps in fused LayerNorm/RMSNorm, and optionally quantizes linear layers to Int8. Produces `deployment_model.pth`. |
 | **6** | `scripts/inference_wan2.1_t2v.sh` / `scripts/inference_wan2.2_i2v.sh` | Runs the TurboDiffusion inference pipeline on `deployment_model.pth` and writes the output video. |
 
-> **Note on the "convert to DCP" step:** there is no separate script to convert a `.pth` file *into* DCP format. The training framework (`train.py`) handles this automatically — it reads `base_model.pth` at startup and writes DCP checkpoints during training. The only explicit checkpoint conversion scripts are `safetensors_to_pth.py` (HuggingFace → `.pth`, done *before* training) and `dcp_to_pth.py` (DCP → `.pth`, done *after* training).
+> **Note on the "convert to DCP" step:** there is no separate script to convert a `.pth` file *into* DCP format. The training framework (`train.py`) handles this automatically — it reads `base_model.pth` at startup and writes DCP checkpoints during training. The only explicit checkpoint conversion scripts are `safetensors_to_pth.py` (Hugging Face → `.pth`, done *before* training) and `dcp_to_pth.py` (DCP → `.pth`, done *after* training).
 
 ### Concrete example (Wan2.1-T2V-1.3B fine-tune)
 
 ```bash
 export PYTHONPATH=turbodiffusion
 
-# 1. Convert HuggingFace base model to .pth
+# 1. Convert Hugging Face base model to .pth
 python turbodiffusion/scripts/safetensors_to_pth.py \
     --model_dir /path/to/Wan2.1-T2V-1.3B \
     --output_path checkpoints/base_model.pth \
@@ -112,7 +112,7 @@ If you have an **existing LoRA** (e.g. one trained with diffusers/PEFT or Kohya 
 ### Pipeline
 
 ```
-HuggingFace base model (safetensors)
+Hugging Face base model (safetensors)
         │
         ▼  (1) safetensors_to_pth.py
 base_model.pth
@@ -125,7 +125,7 @@ lora_merged.pth   (LoRA weights merged in)
         │    deployment_model.pth
         │
         ▼  (4) inference  (wan2.1_t2v_infer.py or wan2.2_i2v_infer.py)
-            [pass --attention_type and --quant_linear if skipping step 3]
+            [use --attention_type / --quant_linear flags as desired]
 output_video.mp4
 ```
 
@@ -139,17 +139,16 @@ The inference scripts (`wan2.1_t2v_infer.py`, `wan2.2_i2v_infer.py`) can apply a
 |------|--------------------------|
 | `--attention_type sla` or `sagesla` | Replaces standard self-attention with SLA/SageSLA on the fly |
 | *(no flag)* `--attention_type original` | Keeps the original attention, no replacement |
-| `--quant_linear` | Wraps `nn.Linear` layers in `Int8Linear` module structure before loading weights |
+| `--quant_linear` | Quantizes `nn.Linear` layers to INT8 in-memory after loading (equivalent to pre-processing with `modify_model.py`) |
 | *(no flag)* | Keeps standard `nn.Linear` throughout |
 
-> **Note on `--quant_linear` at inference time vs. pre-processing:**
-> When `modify_model.py` is run standalone (`quantize.sh`), it computes true INT8
-> quantization of the weight tensors (`quantize=True`) and saves the pre-scaled
-> INT8 weights to disk. When the inference scripts do the replacement at load time
-> they use `quantize=False`, which installs the `Int8Linear` module structure
-> but leaves weights in their original precision. For full INT8 VRAM savings,
-> pre-process with `modify_model.py --quant_linear` once and reuse the deployment
-> checkpoint for all subsequent inference runs.
+> **How `--quant_linear` works at inference time:**
+> `create_model()` first loads the checkpoint with standard `nn.Linear` weights
+> (matching the plain float keys in the file), then applies true INT8 quantization
+> (`quantize=True`) to the loaded weights in-memory.  This produces the same INT8
+> scale factors as pre-processing with `modify_model.py --quant_linear`, without
+> needing a separate deployment checkpoint.  Pre-processing is still useful if you
+> want to avoid paying the quantization cost on every inference run.
 
 **Choose the right path for your use case:**
 
@@ -162,18 +161,18 @@ The inference scripts (`wan2.1_t2v_infer.py`, `wan2.2_i2v_infer.py`) can apply a
 
 | Step | Script | What it does |
 |------|--------|--------------|
-| **1** | `turbodiffusion/scripts/safetensors_to_pth.py` | Convert the downloaded HuggingFace base model from sharded `.safetensors` to `base_model.pth`. Pass `--prefix net.` so key names match the TurboDiffusion format. |
+| **1** | `turbodiffusion/scripts/safetensors_to_pth.py` | Convert the downloaded Hugging Face base model from sharded `.safetensors` to `base_model.pth`. Pass `--prefix net.` so key names match the TurboDiffusion format. |
 | **2** | `turbodiffusion/scripts/lora_merge.py` | Bake the LoRA weights into `base_model.pth`. For each LoRA layer pair computes `delta = lora_up @ lora_down * (alpha / rank) * scale` and adds it to the corresponding base weight. Outputs `lora_merged.pth`. |
 | **3 *(optional)*** | `turbodiffusion/inference/modify_model.py` (via `scripts/quantize.sh`) | Pre-bake SLA/SageSLA attention, fused norms, and optionally INT8-quantize linear layers. Saves a ready-to-load `deployment_model.pth`. Recommended for repeated/production runs; skip for quick one-off testing. |
-| **4** | `scripts/inference_wan2.1_t2v.sh` / `scripts/inference_wan2.2_i2v.sh` | Run TurboDiffusion inference. If step 3 was skipped, pass `--attention_type` and (optionally) `--quant_linear` to the inference script so it applies the same transformations at load time. |
+| **4** | `scripts/inference_wan2.1_t2v.sh` / `scripts/inference_wan2.2_i2v.sh` | Run TurboDiffusion inference. Use `--attention_type` to select the attention variant and `--quant_linear` to enable in-memory INT8 quantization (equivalent to pre-processing, applied automatically after loading). |
 
 ### Key-prefix mapping
 
-The original Wan model on HuggingFace stores weights without any top-level prefix
+The original Wan model on Hugging Face stores weights without any top-level prefix
 (`patch_embedding.weight`, `blocks.0. …`). `safetensors_to_pth.py --prefix net.` adds
 the `net.` prefix expected by TurboDiffusion.
 
-LoRA files trained on the original HuggingFace Wan model via diffusers/PEFT typically
+LoRA files trained on the original Hugging Face Wan model via diffusers/PEFT typically
 prefix keys with `transformer.` (e.g.
 `transformer.blocks.0.attn.to_q.lora_A.weight`). `lora_merge.py` strips that prefix
 and prepends `net.` by default, giving the correct lookup key
@@ -188,13 +187,14 @@ If your LoRA was trained using a different prefix, pass the matching
 #### Path A — Direct inference (skip pre-processing)
 
 Simpler. Best for quick testing or one-off runs. Attention and norm replacement happen
-at every `create_model()` call; `--quant_linear` sets up `Int8Linear` module structure
-but does not compute true INT8 weight scaling.
+at every `create_model()` call. If `--quant_linear` is also passed, the loaded float
+weights are quantized to INT8 in-memory before inference (identical quality to
+pre-processing, at the cost of a one-time quantization step on each run).
 
 ```bash
 export PYTHONPATH=turbodiffusion
 
-# 1. Convert HuggingFace base model to .pth
+# 1. Convert Hugging Face base model to .pth
 python turbodiffusion/scripts/safetensors_to_pth.py \
     --model_dir /path/to/Wan2.1-T2V-1.3B \
     --output_path checkpoints/base_model.pth \
@@ -229,7 +229,7 @@ checkpoint without repeating those transformations.
 ```bash
 export PYTHONPATH=turbodiffusion
 
-# 1. Convert HuggingFace base model to .pth  (same as Path A)
+# 1. Convert Hugging Face base model to .pth  (same as Path A)
 python turbodiffusion/scripts/safetensors_to_pth.py \
     --model_dir /path/to/Wan2.1-T2V-1.3B \
     --output_path checkpoints/base_model.pth \
@@ -430,7 +430,7 @@ python turbodiffusion/scripts/dcp_to_pth.py \
 ---
 
 ### `turbodiffusion/scripts/safetensors_to_pth.py`
-**Purpose:** Merge a sharded HuggingFace-style `.safetensors` model (described by a `diffusion_pytorch_model.safetensors.index.json` index file) into a single `.pth` file. Automatically converts weights to `bfloat16` and reshapes `patch_embedding.weight` from Conv3d to Linear format.
+**Purpose:** Merge a sharded Hugging Face-style `.safetensors` model (described by a `diffusion_pytorch_model.safetensors.index.json` index file) into a single `.pth` file. Automatically converts weights to `bfloat16` and reshapes `patch_embedding.weight` from Conv3d to Linear format.
 
 **Usage:**
 ```bash

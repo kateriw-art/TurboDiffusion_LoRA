@@ -16,7 +16,7 @@ and ``scale`` is a user-supplied multiplier (default ``1.0``).
 
 Key-prefix remapping:
 
-  LoRA files trained on the original HuggingFace Wan model (e.g. via
+  LoRA files trained on the original Hugging Face Wan model (e.g. via
   diffusers/PEFT) typically use ``transformer.`` as the top-level module
   prefix, while TurboDiffusion base models store weights under ``net.``.
   Use ``--lora_key_prefix transformer.`` and ``--model_key_prefix net.``
