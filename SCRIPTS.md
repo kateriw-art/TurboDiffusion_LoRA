@@ -4,6 +4,95 @@ This document summarizes every runnable script in the TurboDiffusion repository,
 
 ---
 
+## End-to-End Workflow
+
+The scripts form a sequential fine-tuning and deployment pipeline. The diagram below shows the order of operations and the file that is produced at each step.
+
+```
+HuggingFace safetensors weights
+        │
+        ▼  (1) safetensors_to_pth.py
+base_model.pth   ◄──── also keep a copy as "diff_base" for the merge step
+        │
+        ▼  (2) train.py  (torchrun)
+            [trainer saves DCP checkpoints automatically]
+        │
+        ▼  (3) dcp_to_pth.py
+finetuned_model.pth   ◄──── "diff_target" for the merge step
+        │
+        ▼  (4) merge_models.py
+merged_model.pth   =  base + w × (finetuned − base)
+        │
+        ▼  (5) modify_model.py  (called by quantize.sh)
+            [replace attention with SLA/SageSLA, optionally quantize linears]
+deployment_model.pth
+        │
+        ▼  (6) inference  (wan2.1_t2v_infer.py or wan2.2_i2v_infer.py)
+output_video.mp4
+```
+
+### Step-by-step explanation
+
+| Step | Script | What it does |
+|------|--------|--------------|
+| **1** | `turbodiffusion/scripts/safetensors_to_pth.py` | Converts a locally saved pretrained Wan base model from HuggingFace sharded `.safetensors` format into a single `base_model.pth`. Download the model weights first (e.g. via `huggingface-cli download` or `wget`), then point `--model_dir` at the directory. Add `--prefix net.` so key names match the training framework. Keep this file — it serves as both the training starting point and the `--diff_base` argument in the merge step. |
+| **2** | `turbodiffusion/scripts/train.py` | Fine-tunes the model (rCM distillation / LoRA / full fine-tune). The trainer loads `base_model.pth` via the config and **automatically saves checkpoints in PyTorch Distributed Checkpoint (DCP) format** — no separate conversion is needed before training. |
+| **3** | `turbodiffusion/scripts/dcp_to_pth.py` | Converts the DCP checkpoint directory produced by training into a single `finetuned_model.pth`. Extracts the EMA weights (`net_ema.*` → `net.*`) and saves in `bfloat16`. |
+| **4** | `turbodiffusion/scripts/merge_models.py` | Applies the trained delta back onto the original base model using vector arithmetic: `merged = base + w × (finetuned − base)`. Pass `base_model.pth` as both `--base` and `--diff_base`, and `finetuned_model.pth` as `--diff_target`. Adjust `--w` (default `1.0`) to control how strongly the fine-tuning is applied. |
+| **5** | `turbodiffusion/inference/modify_model.py` (via `scripts/quantize.sh`) | Prepares `merged_model.pth` for fast deployment: replaces self-attention with SLA or SageSLA, swaps in fused LayerNorm/RMSNorm, and optionally quantizes linear layers to Int8. Produces `deployment_model.pth`. |
+| **6** | `scripts/inference_wan2.1_t2v.sh` / `scripts/inference_wan2.2_i2v.sh` | Runs the TurboDiffusion inference pipeline on `deployment_model.pth` and writes the output video. |
+
+> **Note on the "convert to DCP" step:** there is no separate script to convert a `.pth` file *into* DCP format. The training framework (`train.py`) handles this automatically — it reads `base_model.pth` at startup and writes DCP checkpoints during training. The only explicit checkpoint conversion scripts are `safetensors_to_pth.py` (HuggingFace → `.pth`, done *before* training) and `dcp_to_pth.py` (DCP → `.pth`, done *after* training).
+
+### Concrete example (Wan2.1-T2V-1.3B fine-tune)
+
+```bash
+export PYTHONPATH=turbodiffusion
+
+# 1. Convert HuggingFace base model to .pth
+python turbodiffusion/scripts/safetensors_to_pth.py \
+    --model_dir /path/to/Wan2.1-T2V-1.3B \
+    --output_path checkpoints/base_model.pth \
+    --prefix net.
+
+# 2. Fine-tune  (the trainer saves DCP checkpoints to checkpoints/iter_*/model/)
+torchrun --nproc_per_node=8 -m scripts.train \
+    --config configs/wan2.1_t2v_1.3B.py
+
+# 3. Convert the best DCP checkpoint back to .pth
+python turbodiffusion/scripts/dcp_to_pth.py \
+    --dcp_checkpoint_dir checkpoints/iter_000010000/model \
+    --save_path checkpoints/finetuned_model.pth
+
+# 4. Merge fine-tuned delta onto the base model
+python turbodiffusion/scripts/merge_models.py \
+    --base      checkpoints/base_model.pth \
+    --diff_base checkpoints/base_model.pth \
+    --diff_target checkpoints/finetuned_model.pth \
+    --w 1.0 \
+    --output checkpoints/merged_model.pth
+
+# 5. Prepare for deployment (replace attention + quantize)
+python turbodiffusion/inference/modify_model.py \
+    --model Wan2.1-1.3B \
+    --input_path  checkpoints/merged_model.pth \
+    --output_path checkpoints/deployment_model.pth \
+    --attention_type sla \
+    --quant_linear
+
+# 6. Run inference
+python turbodiffusion/inference/wan2.1_t2v_infer.py \
+    --model Wan2.1-1.3B \
+    --dit_path checkpoints/deployment_model.pth \
+    --prompt "Your prompt here" \
+    --resolution 480p \
+    --num_steps 4 \
+    --quant_linear \
+    --attention_type sagesla
+```
+
+---
+
 ## Shell Scripts (`scripts/`)
 
 ### `scripts/inference_wan2.1_t2v.sh`
